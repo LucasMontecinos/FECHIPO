@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FECHIPO LiveCast</title>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0A1628;--card:#11223B;--border:#1E3A5F;--text:#D4E1F0;--muted:#7A8FA6;--accent:#C41E3A;--accent2:#E8243C;--blue:#1E5BA8;--gold:#D4A843;--green:#22c55e;--red:#ef4444;--white:#fff}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
+input,select,button{font-family:inherit;outline:none}
+.os{font-family:'Oswald',sans-serif}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--muted)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.fade-in{animation:fadeIn .3s ease}
+.pulse{animation:pulse 1.5s ease-in-out infinite}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useCallback,useMemo,useRef} = React;
+
+// ── GL Points Coefficients (IPF Goodlift) ──
+const GL_COEFF = {
+  M: { a: 1199.72839, b: 1025.18162, c: 0.00921 },
+  F: { a: 610.32796, b: 560.22205, c: 0.01289 }
+};
+function calcGL(total, bw, sex) {
+  if (!total || !bw || total <= 0) return 0;
+  const s = sex === 'Hombre' || sex === 'M' ? 'M' : 'F';
+  const {a, b, c} = GL_COEFF[s];
+  const denom = a - b * Math.exp(-c * bw);
+  return denom > 0 ? Math.round((total * 100 / denom) * 100) / 100 : 0;
+}
+
+// ── Lift helpers ──
+const LIFTS = ['sq', 'bp', 'dl'];
+const LIFT_NAMES = { sq: 'SQUAT', bp: 'BENCH PRESS', dl: 'DEADLIFT' };
+const LIFT_SHORT = { sq: 'SQ', bp: 'BP', dl: 'DL' };
+const LIFT_COLORS = { sq: '#3b82f6', bp: '#f59e0b', dl: '#ef4444' };
+
+function bestLift(athlete, lift) {
+  const attempts = athlete.attempts[lift];
+  let best = 0;
+  for (const a of attempts) {
+    if (a.result === 'good' && a.weight > best) best = a.weight;
+  }
+  return best;
+}
+
+function athleteTotal(athlete) {
+  const s = bestLift(athlete, 'sq');
+  const b = bestLift(athlete, 'bp');
+  const d = bestLift(athlete, 'dl');
+  if (s === 0 || b === 0 || d === 0) return 0;
+  return s + b + d;
+}
+
+function makeAttempts() {
+  return {
+    sq: [{w:0,result:null},{w:0,result:null},{w:0,result:null}],
+    bp: [{w:0,result:null},{w:0,result:null},{w:0,result:null}],
+    dl: [{w:0,result:null},{w:0,result:null},{w:0,result:null}],
+  };
+}
+
+// ── Lifting order (IPF rules) ──
+function liftOrder(athletes, lift, round) {
+  const active = athletes.filter(a => {
+    if (a.bombed) return false;
+    // Check if already attempted this round
+    const att = a.attempts[lift][round];
+    if (att.result !== null) return false;
+    // Must have declared weight
+    if (!att.w || att.w <= 0) return false;
+    return true;
+  });
+  return active.sort((a, b) => {
+    const wA = a.attempts[lift][round].w;
+    const wB = b.attempts[lift][round].w;
+    if (wA !== wB) return wA - wB;
+    return a.lot - b.lot;
+  });
+}
+
+// ── Storage ──
+const STORAGE_KEY = 'fechipo_livecast_v1';
+function saveState(state) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch(e) {}
+}
+function loadState() {
+  try {
+    const s = localStorage.getItem(STORAGE_KEY);
+    return s ? JSON.parse(s) : null;
+  } catch(e) { return null; }
+}
+
+// ── Shared Card Component ──
+function Card({children, style, className}) {
+  return <div style={{background:'var(--card)',border:'1px solid var(--border)',borderRadius:12,padding:20,...style}} className={className}>{children}</div>;
+}
+function Btn({children, color='var(--accent)', onClick, style, disabled}) {
+  return <button onClick={onClick} disabled={disabled} style={{background:color,color:'#fff',border:'none',borderRadius:8,padding:'10px 20px',fontWeight:600,fontSize:13,cursor:disabled?'not-allowed':'pointer',opacity:disabled?.5:1,fontFamily:'Oswald',letterSpacing:1,textTransform:'uppercase',transition:'all .15s',...style}}>{children}</button>;
+}
+
+// ══════════════════════════════════════════════
+// MAIN APP
+// ══════════════════════════════════════════════
+function App() {
+  const [phase, setPhase] = useState('setup');
+  const [events, setEvents] = useState([]);
+  const [records, setRecords] = useState({});
+  const [event, setEvent] = useState(null);
+  const [athletes, setAthletes] = useState([]);
+  const [currentLift, setCurrentLift] = useState('sq');
+  const [currentRound, setCurrentRound] = useState(0);
+  const [viewMode, setViewMode] = useState('control');
+  const [timer, setTimer] = useState(60);
+  const [timerRunning, setTimerRunning] = useState(false);
+  const [recordAlerts, setRecordAlerts] = useState([]);
+
+  // Load saved state or nominas
+  useEffect(() => {
+    const saved = loadState();
+    if (saved && saved.phase !== 'setup') {
+      setPhase(saved.phase);
+      setEvent(saved.event);
+      setAthletes(saved.athletes);
+      setCurrentLift(saved.currentLift || 'sq');
+      setCurrentRound(saved.currentRound || 0);
+    }
+    fetch('nominas.json').then(r=>r.json()).then(n=>setEvents(n.events||[])).catch(()=>{});
+    fetch('records.json').then(r=>r.json()).then(r=>setRecords(r)).catch(()=>{});
+  }, []);
+
+  // Auto-save
+  useEffect(() => {
+    if (phase !== 'setup') saveState({phase, event, athletes, currentLift, currentRound});
+  }, [phase, event, athletes, currentLift, currentRound]);
+
+  // Timer
+  useEffect(() => {
+    if (!timerRunning || timer <= 0) { if(timer<=0) setTimerRunning(false); return; }
+    const id = setInterval(() => setTimer(t => t - 1), 1000);
+    return () => clearInterval(id);
+  }, [timerRunning, timer]);
+
+  const resetTimer = () => { setTimer(60); setTimerRunning(false); };
+  const startTimer = () => setTimerRunning(true);
+  const pauseTimer = () => setTimerRunning(false);
+
+  // Select event and import athletes
+  const selectEvent = (ev) => {
+    setEvent(ev);
+    const imported = ev.athletes.map((a, i) => ({
+      ...a, id: i, lot: i + 1, bodyweight: 0, bombed: false,
+      attempts: makeAttempts(),
+    }));
+    setAthletes(imported);
+    setPhase('weighin');
+  };
+
+  // Update athlete
+  const updateAthlete = (id, updates) => {
+    setAthletes(prev => prev.map(a => a.id === id ? {...a, ...updates} : a));
+  };
+
+  // Set attempt weight
+  const setAttemptWeight = (athleteId, lift, round, weight) => {
+    setAthletes(prev => prev.map(a => {
+      if (a.id !== athleteId) return a;
+      const newAttempts = {...a.attempts};
+      newAttempts[lift] = [...newAttempts[lift]];
+      newAttempts[lift][round] = {...newAttempts[lift][round], w: parseFloat(weight) || 0};
+      return {...a, attempts: newAttempts};
+    }));
+  };
+
+  // Record attempt result
+  const recordResult = (athleteId, lift, round, result) => {
+    setAthletes(prev => {
+      const updated = prev.map(a => {
+        if (a.id !== athleteId) return a;
+        const newAttempts = {...a.attempts};
+        newAttempts[lift] = [...newAttempts[lift]];
+        newAttempts[lift][round] = {...newAttempts[lift][round], result};
+        // Auto-copy weight to next attempt if good
+        if (round < 2) {
+          const nextW = newAttempts[lift][round + 1].w;
+          if (!nextW || nextW === 0) {
+            newAttempts[lift][round + 1] = {...newAttempts[lift][round + 1], w: newAttempts[lift][round].w + 2.5};
+          }
+        }
+        return {...a, attempts: newAttempts};
+      });
+      // Check for bomb-out
+      return updated.map(a => {
+        if (a.id !== athleteId) return a;
+        const allFailed = a.attempts[lift].every(att => att.result === 'nolift');
+        if (allFailed && a.attempts[lift][2].result !== null) {
+          return {...a, bombed: true};
+        }
+        return a;
+      });
+    });
+    resetTimer();
+  };
+
+  // Rankings
+  const rankings = useMemo(() => {
+    return [...athletes]
+      .map(a => ({...a, total: athleteTotal(a), gl: calcGL(athleteTotal(a), a.bodyweight, a.sexo || a.sex)}))
+      .filter(a => a.total > 0)
+      .sort((a, b) => b.gl - a.gl);
+  }, [athletes]);
+
+  // New competition
+  const newComp = () => {
+    localStorage.removeItem(STORAGE_KEY);
+    setPhase('setup');
+    setEvent(null);
+    setAthletes([]);
+    setCurrentLift('sq');
+    setCurrentRound(0);
+  };
+
+  // Export results
+  const exportResults = () => {
+    const results = athletes.map(a => {
+      const t = athleteTotal(a);
+      return {
+        nombre: a.nombre,
+        rut: a.rut || '',
+        sexo: a.sexo || a.sex || '',
+        categoria: a.categoria || a.weightClass || '',
+        bodyweight: a.bodyweight,
+        sq: bestLift(a, 'sq'),
+        bp: bestLift(a, 'bp'),
+        dl: bestLift(a, 'dl'),
+        total: t,
+        gl: calcGL(t, a.bodyweight, a.sexo || a.sex),
+        club: a.club || '',
+        bombed: a.bombed,
+      };
+    }).filter(r => r.total > 0).sort((a,b) => b.gl - a.gl);
+    
+    const blob = new Blob([JSON.stringify(results, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `resultados_${(event?.short || 'comp').replace(/\s/g,'_')}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Header
+  const Header = () => (
+    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'12px 20px',borderBottom:'1px solid var(--border)',background:'rgba(17,34,59,.95)',position:'sticky',top:0,zIndex:100,backdropFilter:'blur(10px)'}}>
+      <div style={{display:'flex',alignItems:'center',gap:12}}>
+        <div style={{fontFamily:'Oswald',fontSize:22,fontWeight:700,letterSpacing:2}}>
+          <span style={{color:'var(--accent)'}}>FECHIPO</span> <span style={{fontWeight:400,color:'var(--muted)'}}>LiveCast</span>
+        </div>
+        {event && <span style={{fontSize:11,color:'var(--muted)',background:'var(--bg)',padding:'4px 10px',borderRadius:20}}>{event.short}</span>}
+      </div>
+      <div style={{display:'flex',gap:6}}>
+        {phase === 'competition' && <>
+          {['control','scoreboard'].map(m => (
+            <button key={m} onClick={()=>setViewMode(m)} style={{padding:'6px 14px',borderRadius:6,border:'1px solid '+(viewMode===m?'var(--accent)':'var(--border)'),background:viewMode===m?'var(--accent)':'transparent',color:viewMode===m?'#fff':'var(--muted)',fontSize:11,cursor:'pointer',fontFamily:'Oswald',letterSpacing:1,textTransform:'uppercase'}}>
+              {m==='control'?'⚙ Control':'📺 Scoreboard'}
+            </button>
+          ))}
+        </>}
+        {phase !== 'setup' && <button onClick={newComp} style={{padding:'6px 14px',borderRadius:6,border:'1px solid var(--border)',background:'transparent',color:'var(--muted)',fontSize:11,cursor:'pointer',fontFamily:'Oswald',letterSpacing:1}}>NUEVA</button>}
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{minHeight:'100vh'}}>
+      <Header />
+      <div style={{maxWidth:phase==='competition'&&viewMode==='scoreboard'?'100%':1100,margin:'0 auto',padding:phase==='competition'&&viewMode==='scoreboard'?'0':'16px 20px'}}>
+        {phase === 'setup' && <SetupView events={events} onSelect={selectEvent} />}
+        {phase === 'weighin' && <WeighInView athletes={athletes} event={event} updateAthlete={updateAthlete} onStart={() => {setPhase('competition'); setCurrentLift('sq'); setCurrentRound(0);}} />}
+        {phase === 'competition' && viewMode === 'control' && (
+          <ControlView athletes={athletes} currentLift={currentLift} currentRound={currentRound} setCurrentLift={setCurrentLift} setCurrentRound={setCurrentRound} setAttemptWeight={setAttemptWeight} recordResult={recordResult} rankings={rankings} timer={timer} timerRunning={timerRunning} startTimer={startTimer} pauseTimer={pauseTimer} resetTimer={resetTimer} onFinish={()=>setPhase('results')} records={records} event={event} />
+        )}
+        {phase === 'competition' && viewMode === 'scoreboard' && (
+          <ScoreboardView athletes={athletes} currentLift={currentLift} currentRound={currentRound} rankings={rankings} event={event} timer={timer} timerRunning={timerRunning} />
+        )}
+        {phase === 'results' && <ResultsView rankings={rankings} athletes={athletes} event={event} exportResults={exportResults} records={records} />}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+// SETUP VIEW
+// ══════════════════════════════════════════════
+function SetupView({events, onSelect}) {
+  return (
+    <div className="fade-in" style={{maxWidth:700,margin:'60px auto'}}>
+      <div style={{textAlign:'center',marginBottom:40}}>
+        <h1 className="os" style={{fontSize:'clamp(28px,5vw,42px)',fontWeight:700,letterSpacing:3}}>
+          <span style={{color:'var(--accent)'}}>LIVE</span>CAST
+        </h1>
+        <p style={{color:'var(--muted)',fontSize:14,marginTop:8}}>Sistema de Gestión de Competencia en Vivo</p>
+        <div style={{width:60,height:3,background:'linear-gradient(90deg,var(--accent),var(--gold))',margin:'12px auto',borderRadius:2}}></div>
+      </div>
+      
+      {events.length === 0 && (
+        <Card style={{textAlign:'center',padding:40}}>
+          <p style={{color:'var(--muted)'}}>Cargando competencias desde nominas.json...</p>
+          <p style={{color:'var(--muted)',fontSize:12,marginTop:8}}>Asegúrate de que el archivo esté en la misma carpeta</p>
+        </Card>
+      )}
+      
+      {events.map((ev, i) => (
+        <Card key={i} style={{marginBottom:16,cursor:'pointer',transition:'border-color .2s,transform .15s'}}
+          onClick={() => onSelect(ev)}
+          onMouseEnter={e => {e.currentTarget.style.borderColor='var(--accent)';e.currentTarget.style.transform='translateX(4px)'}}
+          onMouseLeave={e => {e.currentTarget.style.borderColor='var(--border)';e.currentTarget.style.transform='none'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <div>
+              <h2 className="os" style={{fontSize:18,letterSpacing:1}}>{ev.name}</h2>
+              <p style={{color:'var(--muted)',fontSize:12,marginTop:4}}>{ev.organizer} · {ev.location} · {ev.days}</p>
+            </div>
+            <div style={{textAlign:'right'}}>
+              <div style={{background:'var(--accent)',color:'#fff',padding:'4px 14px',borderRadius:20,fontSize:14,fontWeight:700,fontFamily:'Oswald'}}>{ev.athletes.length}</div>
+              <div style={{fontSize:10,color:'var(--muted)',marginTop:2}}>atletas</div>
+            </div>
+          </div>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+// WEIGH-IN VIEW
+// ══════════════════════════════════════════════
+function WeighInView({athletes, event, updateAthlete, onStart}) {
+  const allWeighed = athletes.every(a => a.bodyweight > 0);
+  const weighed = athletes.filter(a => a.bodyweight > 0).length;
+  
+  return (
+    <div className="fade-in">
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',margin:'20px 0'}}>
+        <div>
+          <h2 className="os" style={{fontSize:22,letterSpacing:1}}>PESAJE</h2>
+          <p style={{color:'var(--muted)',fontSize:12}}>{weighed}/{athletes.length} atletas pesados</p>
+        </div>
+        <Btn onClick={onStart} disabled={!allWeighed} color={allWeighed?'var(--green)':'var(--border)'}>
+          Iniciar Competencia →
+        </Btn>
+      </div>
+      
+      <div style={{display:'grid',gap:6}}>
+        {athletes.map(a => (
+          <div key={a.id} style={{display:'grid',gridTemplateColumns:'40px 1fr 100px 100px 120px',gap:10,alignItems:'center',padding:'10px 14px',background:'var(--card)',borderRadius:8,border:'1px solid var(--border)',fontSize:13}}>
+            <span style={{color:'var(--gold)',fontWeight:700,fontFamily:'Oswald',textAlign:'center'}}>{a.lot}</span>
+            <div>
+              <div style={{fontWeight:600}}>{a.nombre}</div>
+              <div style={{fontSize:11,color:'var(--muted)'}}>{a.club}</div>
+            </div>
+            <span style={{textAlign:'center',color:'var(--muted)',fontSize:11}}>{a.categoria}</span>
+            <span style={{textAlign:'center',fontSize:11,color:a.sexo==='Hombre'||a.sex==='Hombre'?'var(--blue)':'var(--accent)'}}>{a.sexo||a.sex}</span>
+            <input type="number" step="0.1" placeholder="Peso (kg)" value={a.bodyweight||''} onChange={e => updateAthlete(a.id, {bodyweight: parseFloat(e.target.value)||0})}
+              style={{padding:'8px 10px',borderRadius:6,border:'1px solid '+(a.bodyweight>0?'var(--green)':'var(--border)'),background:'var(--bg)',color:'var(--text)',fontSize:13,textAlign:'center',width:'100%'}} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+// CONTROL VIEW (Mesa de Control)
+// ══════════════════════════════════════════════
+function ControlView({athletes, currentLift, currentRound, setCurrentLift, setCurrentRound, setAttemptWeight, recordResult, rankings, timer, timerRunning, startTimer, pauseTimer, resetTimer, onFinish, records, event}) {
+  const [selectedAthlete, setSelectedAthlete] = useState(null);
+  
+  const order = useMemo(() => liftOrder(athletes, currentLift, currentRound), [athletes, currentLift, currentRound]);
+  const nextUp = order[0] || null;
+  
+  // Auto-select first in order
+  useEffect(() => {
+    if (nextUp && (!selectedAthlete || selectedAthlete.id !== nextUp.id)) {
+      setSelectedAthlete(nextUp);
+    }
+  }, [nextUp]);
+
+  const advanceLift = () => {
+    const li = LIFTS.indexOf(currentLift);
+    if (currentRound < 2) {
+      setCurrentRound(currentRound + 1);
+    } else if (li < 2) {
+      setCurrentLift(LIFTS[li + 1]);
+      setCurrentRound(0);
+    } else {
+      onFinish();
+    }
+  };
+
+  const activeAthletes = athletes.filter(a => !a.bombed);
+  const roundDone = order.length === 0;
+
+  return (
+    <div className="fade-in" style={{display:'grid',gridTemplateColumns:'1fr 340px',gap:16,marginTop:16}}>
+      {/* Left: Main control */}
+      <div>
+        {/* Lift & Round nav */}
+        <div style={{display:'flex',gap:6,marginBottom:12}}>
+          {LIFTS.map(l => (
+            <button key={l} onClick={()=>{setCurrentLift(l);setCurrentRound(0);}} className="os" style={{flex:1,padding:'10px 0',borderRadius:8,border:'2px solid '+(currentLift===l?LIFT_COLORS[l]:'var(--border)'),background:currentLift===l?LIFT_COLORS[l]+'20':'transparent',color:currentLift===l?LIFT_COLORS[l]:'var(--muted)',fontSize:14,fontWeight:700,letterSpacing:2,cursor:'pointer',transition:'all .2s'}}>
+              {LIFT_NAMES[l]}
+            </button>
+          ))}
+        </div>
+        
+        {/* Round selector */}
+        <div style={{display:'flex',gap:6,marginBottom:16}}>
+          {[0,1,2].map(r => (
+            <button key={r} onClick={()=>setCurrentRound(r)} className="os" style={{flex:1,padding:'8px 0',borderRadius:6,border:'1px solid '+(currentRound===r?'var(--gold)':'var(--border)'),background:currentRound===r?'rgba(212,168,67,.15)':'transparent',color:currentRound===r?'var(--gold)':'var(--muted)',fontSize:12,fontWeight:600,letterSpacing:1,cursor:'pointer'}}>
+              INTENTO {r+1}
+            </button>
+          ))}
+        </div>
+
+        {/* Timer */}
+        <Card style={{marginBottom:12,padding:12,display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+          <div style={{display:'flex',alignItems:'center',gap:12}}>
+            <span className="os" style={{fontSize:36,fontWeight:700,color:timer<=10?'var(--red)':timer<=30?'var(--gold)':'var(--green)',minWidth:70,textAlign:'center'}}>{Math.floor(timer/60)}:{String(timer%60).padStart(2,'0')}</span>
+          </div>
+          <div style={{display:'flex',gap:6}}>
+            <Btn onClick={startTimer} color="var(--green)" style={{padding:'8px 14px',fontSize:11}} disabled={timerRunning}>▶</Btn>
+            <Btn onClick={pauseTimer} color="var(--gold)" style={{padding:'8px 14px',fontSize:11}}>⏸</Btn>
+            <Btn onClick={resetTimer} color="var(--muted)" style={{padding:'8px 14px',fontSize:11}}>↺</Btn>
+          </div>
+        </Card>
+
+        {/* Current lifter control */}
+        {selectedAthlete && (
+          <Card style={{marginBottom:12,borderLeft:'4px solid '+LIFT_COLORS[currentLift]}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+              <div>
+                <div className="os" style={{fontSize:20,fontWeight:700}}>{selectedAthlete.nombre}</div>
+                <div style={{fontSize:12,color:'var(--muted)'}}>{selectedAthlete.club} · Lot #{selectedAthlete.lot} · {selectedAthlete.bodyweight}kg</div>
+              </div>
+              <div style={{background:LIFT_COLORS[currentLift],color:'#fff',padding:'4px 12px',borderRadius:6,fontFamily:'Oswald',fontWeight:700,fontSize:13}}>
+                {LIFT_SHORT[currentLift]}{currentRound+1}
+              </div>
+            </div>
+
+            {/* Weight input */}
+            <div style={{display:'flex',gap:10,alignItems:'center',marginBottom:14}}>
+              <span style={{color:'var(--muted)',fontSize:12,minWidth:50}}>Peso:</span>
+              <input type="number" step="2.5" value={selectedAthlete.attempts[currentLift][currentRound].w || ''} onChange={e => setAttemptWeight(selectedAthlete.id, currentLift, currentRound, e.target.value)}
+                style={{flex:1,padding:'12px 14px',borderRadius:8,border:'2px solid '+LIFT_COLORS[currentLift],background:'var(--bg)',color:'var(--text)',fontSize:22,fontWeight:700,fontFamily:'Oswald',textAlign:'center',letterSpacing:2}} />
+              <span className="os" style={{color:'var(--muted)',fontSize:16}}>KG</span>
+            </div>
+
+            {/* Judge decision */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+              <button onClick={() => {recordResult(selectedAthlete.id, currentLift, currentRound, 'good'); resetTimer();}} style={{padding:16,borderRadius:10,border:'3px solid var(--green)',background:'rgba(34,197,94,.1)',color:'var(--green)',fontSize:18,fontWeight:700,fontFamily:'Oswald',letterSpacing:2,cursor:'pointer',transition:'all .15s'}}
+                onMouseEnter={e=>e.currentTarget.style.background='rgba(34,197,94,.25)'}
+                onMouseLeave={e=>e.currentTarget.style.background='rgba(34,197,94,.1)'}>
+                ✓ GOOD LIFT
+              </button>
+              <button onClick={() => {recordResult(selectedAthlete.id, currentLift, currentRound, 'nolift'); resetTimer();}} style={{padding:16,borderRadius:10,border:'3px solid var(--red)',background:'rgba(239,68,68,.1)',color:'var(--red)',fontSize:18,fontWeight:700,fontFamily:'Oswald',letterSpacing:2,cursor:'pointer',transition:'all .15s'}}
+                onMouseEnter={e=>e.currentTarget.style.background='rgba(239,68,68,.25)'}
+                onMouseLeave={e=>e.currentTarget.style.background='rgba(239,68,68,.1)'}>
+                ✗ NO LIFT
+              </button>
+            </div>
+          </Card>
+        )}
+
+        {roundDone && (
+          <Card style={{textAlign:'center',padding:24}}>
+            <p className="os" style={{fontSize:16,color:'var(--gold)',marginBottom:12}}>RONDA COMPLETADA</p>
+            <Btn onClick={advanceLift} color="var(--gold)">
+              {currentRound < 2 ? `Intento ${currentRound+2} →` : LIFTS.indexOf(currentLift) < 2 ? `${LIFT_NAMES[LIFTS[LIFTS.indexOf(currentLift)+1]]} →` : 'Ver Resultados →'}
+            </Btn>
+          </Card>
+        )}
+
+        {/* Lifting order queue */}
+        <Card style={{marginTop:12}}>
+          <h3 className="os" style={{fontSize:14,letterSpacing:1,marginBottom:10,color:'var(--muted)'}}>ORDEN DE LEVANTAMIENTO</h3>
+          {order.length === 0 && <p style={{color:'var(--muted)',fontSize:12,textAlign:'center',padding:12}}>Sin atletas pendientes en esta ronda</p>}
+          {order.map((a, i) => (
+            <div key={a.id} onClick={() => setSelectedAthlete(a)} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 10px',borderRadius:6,marginBottom:4,cursor:'pointer',background:selectedAthlete?.id===a.id?LIFT_COLORS[currentLift]+'15':'transparent',border:'1px solid '+(selectedAthlete?.id===a.id?LIFT_COLORS[currentLift]+'40':'transparent'),transition:'all .15s'}}>
+              <div style={{display:'flex',alignItems:'center',gap:10}}>
+                <span style={{color:'var(--gold)',fontWeight:700,fontFamily:'Oswald',width:24,textAlign:'center'}}>{i+1}</span>
+                <span style={{fontWeight:600,fontSize:13}}>{a.nombre}</span>
+              </div>
+              <span className="os" style={{color:LIFT_COLORS[currentLift],fontWeight:700,fontSize:16}}>{a.attempts[currentLift][currentRound].w} kg</span>
+            </div>
+          ))}
+        </Card>
+      </div>
+
+      {/* Right: Live standings */}
+      <div>
+        <Card style={{position:'sticky',top:60}}>
+          <h3 className="os" style={{fontSize:14,letterSpacing:1,marginBottom:12,color:'var(--gold)'}}>RANKING EN VIVO</h3>
+          {rankings.length === 0 && <p style={{color:'var(--muted)',fontSize:12,textAlign:'center',padding:20}}>Sin totales completados aún</p>}
+          {rankings.map((a, i) => (
+            <div key={a.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 10px',borderBottom:'1px solid rgba(30,58,95,.3)',fontSize:12}}>
+              <div style={{display:'flex',alignItems:'center',gap:8}}>
+                <span className="os" style={{color:'var(--gold)',fontWeight:700,width:20}}>{i+1}</span>
+                <div>
+                  <div style={{fontWeight:600,fontSize:13}}>{a.nombre}</div>
+                  <div style={{color:'var(--muted)',fontSize:10}}>{a.bodyweight}kg · {a.categoria}</div>
+                </div>
+              </div>
+              <div style={{textAlign:'right'}}>
+                <div className="os" style={{color:'var(--gold)',fontWeight:700,fontSize:15}}>{a.gl}</div>
+                <div style={{color:'var(--muted)',fontSize:10}}>{a.total}kg</div>
+              </div>
+            </div>
+          ))}
+          
+          {/* Attempt summary */}
+          <h3 className="os" style={{fontSize:14,letterSpacing:1,marginTop:16,marginBottom:8,color:'var(--muted)'}}>INTENTOS RONDA</h3>
+          <div style={{fontSize:11}}>
+            {activeAthletes.map(a => {
+              const att = a.attempts[currentLift];
+              return (
+                <div key={a.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'4px 0',borderBottom:'1px solid rgba(30,58,95,.15)'}}>
+                  <span style={{fontSize:11,maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{a.nombre}</span>
+                  <div style={{display:'flex',gap:4}}>
+                    {att.map((at, j) => (
+                      <span key={j} style={{width:50,textAlign:'center',padding:'2px 4px',borderRadius:4,fontSize:10,fontWeight:600,fontFamily:'Oswald',
+                        background:at.result==='good'?'rgba(34,197,94,.15)':at.result==='nolift'?'rgba(239,68,68,.15)':'transparent',
+                        color:at.result==='good'?'var(--green)':at.result==='nolift'?'var(--red)':'var(--muted)',
+                        border:'1px solid '+(at.result==='good'?'rgba(34,197,94,.3)':at.result==='nolift'?'rgba(239,68,68,.3)':'var(--border)'),
+                        textDecoration:at.result==='nolift'?'line-through':'none'
+                      }}>
+                        {at.w > 0 ? at.w : '—'}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+// SCOREBOARD VIEW (Proyección)
+// ══════════════════════════════════════════════
+function ScoreboardView({athletes, currentLift, currentRound, rankings, event, timer, timerRunning}) {
+  const order = liftOrder(athletes, currentLift, currentRound);
+  const current = order[0];
+  const onDeck = order[1];
+  const activeAthletes = athletes.filter(a => !a.bombed);
+
+  return (
+    <div style={{minHeight:'100vh',background:'var(--bg)',padding:0}}>
+      {/* Top bar */}
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'12px 30px',background:'linear-gradient(90deg,var(--accent),#8B1525)',color:'#fff'}}>
+        <div className="os" style={{fontSize:24,fontWeight:700,letterSpacing:3}}>FECHIPO LIVECAST</div>
+        <div className="os" style={{fontSize:16,letterSpacing:1}}>{event?.short}</div>
+        <div style={{display:'flex',alignItems:'center',gap:16}}>
+          <div className="os" style={{fontSize:14,letterSpacing:2,background:LIFT_COLORS[currentLift],padding:'4px 16px',borderRadius:6,fontWeight:700}}>
+            {LIFT_NAMES[currentLift]} — INTENTO {currentRound+1}
+          </div>
+        </div>
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'1fr 380px',minHeight:'calc(100vh - 56px)'}}>
+        {/* Left: Current lifter */}
+        <div style={{display:'flex',flexDirection:'column',justifyContent:'center',alignItems:'center',padding:40}}>
+          {current ? (<>
+            {/* Timer */}
+            <div className="os" style={{fontSize:72,fontWeight:700,color:timer<=10?'var(--red)':timer<=30?'var(--gold)':'var(--green)',marginBottom:20,opacity:timerRunning?1:.4}}>
+              {timerRunning && <span className={timer<=10?'pulse':''}>{Math.floor(timer/60)}:{String(timer%60).padStart(2,'0')}</span>}
+            </div>
+            <div className="os" style={{fontSize:'clamp(32px,5vw,52px)',fontWeight:700,letterSpacing:2,textAlign:'center',marginBottom:8}}>{current.nombre}</div>
+            <div style={{color:'var(--muted)',fontSize:16,marginBottom:24}}>{current.club} · {current.bodyweight}kg · Lot #{current.lot}</div>
+            <div className="os" style={{fontSize:80,fontWeight:700,color:LIFT_COLORS[currentLift],letterSpacing:4}}>
+              {current.attempts[currentLift][currentRound].w || '—'} <span style={{fontSize:36,color:'var(--muted)'}}>KG</span>
+            </div>
+            {/* Previous attempts */}
+            <div style={{display:'flex',gap:16,marginTop:30}}>
+              {current.attempts[currentLift].map((att, j) => (
+                <div key={j} style={{textAlign:'center',opacity:j===currentRound?1:.5}}>
+                  <div style={{fontSize:10,color:'var(--muted)',marginBottom:4,fontFamily:'Oswald',letterSpacing:1}}>INT {j+1}</div>
+                  <div className="os" style={{fontSize:28,fontWeight:700,
+                    color:att.result==='good'?'var(--green)':att.result==='nolift'?'var(--red)':'var(--muted)',
+                    textDecoration:att.result==='nolift'?'line-through':'none'
+                  }}>{att.w||'—'}</div>
+                </div>
+              ))}
+            </div>
+            {onDeck && <div style={{marginTop:40,color:'var(--muted)',fontSize:13}}>Siguiente: <span style={{color:'var(--text)',fontWeight:600}}>{onDeck.nombre}</span> — {onDeck.attempts[currentLift][currentRound].w}kg</div>}
+          </>) : (
+            <div className="os" style={{fontSize:28,color:'var(--gold)',letterSpacing:2}}>RONDA COMPLETADA</div>
+          )}
+        </div>
+
+        {/* Right: Rankings */}
+        <div style={{background:'rgba(17,34,59,.8)',borderLeft:'1px solid var(--border)',padding:20,overflowY:'auto'}}>
+          <h3 className="os" style={{fontSize:16,letterSpacing:2,color:'var(--gold)',marginBottom:12,textAlign:'center'}}>RANKING GL POINTS</h3>
+          {rankings.map((a, i) => (
+            <div key={a.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 12px',borderBottom:'1px solid rgba(30,58,95,.3)',background:current&&a.id===current.id?LIFT_COLORS[currentLift]+'15':'transparent',borderRadius:4}}>
+              <div style={{display:'flex',alignItems:'center',gap:10}}>
+                <span className="os" style={{color:i<3?'var(--gold)':'var(--muted)',fontWeight:700,fontSize:18,width:28}}>{i+1}</span>
+                <div>
+                  <div style={{fontWeight:600,fontSize:14}}>{a.nombre}</div>
+                  <div style={{fontSize:11,color:'var(--muted)'}}>
+                    SQ {bestLift(a,'sq')} · BP {bestLift(a,'bp')} · DL {bestLift(a,'dl')}
+                  </div>
+                </div>
+              </div>
+              <div style={{textAlign:'right'}}>
+                <div className="os" style={{fontSize:20,fontWeight:700,color:'var(--gold)'}}>{a.gl}</div>
+                <div style={{fontSize:11,color:'var(--muted)'}}>{a.total}kg</div>
+              </div>
+            </div>
+          ))}
+          
+          {rankings.length === 0 && (
+            <div style={{textAlign:'center',padding:40}}>
+              <p style={{color:'var(--muted)',fontSize:13}}>Sin totales completados</p>
+              <p style={{color:'var(--muted)',fontSize:11,marginTop:8}}>Los rankings aparecerán cuando los atletas completen los 3 levantamientos</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+// RESULTS VIEW
+// ══════════════════════════════════════════════
+function ResultsView({rankings, athletes, event, exportResults, records}) {
+  return (
+    <div className="fade-in" style={{marginTop:20}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:20}}>
+        <div>
+          <h2 className="os" style={{fontSize:26,letterSpacing:2}}>RESULTADOS FINALES</h2>
+          <p style={{color:'var(--muted)',fontSize:12}}>{event?.name}</p>
+        </div>
+        <Btn onClick={exportResults} color="var(--green)">📥 Exportar JSON</Btn>
+      </div>
+
+      {/* Stats summary */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:20}}>
+        {[
+          ['Total Atletas', athletes.length, 'var(--blue)'],
+          ['Clasificados', rankings.length, 'var(--green)'],
+          ['Bombed Out', athletes.filter(a=>a.bombed).length, 'var(--red)'],
+          ['Mejor GL', rankings[0]?.gl || '—', 'var(--gold)'],
+        ].map(([l,v,c],i) => (
+          <Card key={i} style={{textAlign:'center',padding:16}}>
+            <div className="os" style={{fontSize:28,fontWeight:700,color:c}}>{v}</div>
+            <div style={{fontSize:10,color:'var(--muted)',textTransform:'uppercase',letterSpacing:1,marginTop:4}}>{l}</div>
+          </Card>
+        ))}
+      </div>
+
+      {/* Results table */}
+      <Card>
+        <div style={{overflowX:'auto'}}>
+          <table style={{width:'100%',borderCollapse:'collapse',fontSize:13}}>
+            <thead>
+              <tr style={{borderBottom:'2px solid var(--border)'}}>
+                {['#','Atleta','BW','Cat.','SQ','BP','DL','Total','GL Pts'].map(h => (
+                  <th key={h} className="os" style={{padding:'10px 8px',textAlign:h==='Atleta'?'left':'center',color:'var(--muted)',fontSize:11,letterSpacing:1,textTransform:'uppercase'}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rankings.map((a, i) => (
+                <tr key={a.id} style={{borderBottom:'1px solid rgba(30,58,95,.3)'}}>
+                  <td className="os" style={{padding:'10px 8px',textAlign:'center',color:'var(--gold)',fontWeight:700,fontSize:16}}>{i+1}</td>
+                  <td style={{padding:'10px 8px'}}>
+                    <div style={{fontWeight:600}}>{a.nombre}</div>
+                    <div style={{fontSize:10,color:'var(--muted)'}}>{a.club}</div>
+                  </td>
+                  <td style={{padding:'10px 8px',textAlign:'center'}}>{a.bodyweight}</td>
+                  <td style={{padding:'10px 8px',textAlign:'center',fontSize:11}}>{a.categoria}</td>
+                  <td className="os" style={{padding:'10px 8px',textAlign:'center',fontWeight:700,color:'#3b82f6'}}>{bestLift(a,'sq')||'—'}</td>
+                  <td className="os" style={{padding:'10px 8px',textAlign:'center',fontWeight:700,color:'#f59e0b'}}>{bestLift(a,'bp')||'—'}</td>
+                  <td className="os" style={{padding:'10px 8px',textAlign:'center',fontWeight:700,color:'#ef4444'}}>{bestLift(a,'dl')||'—'}</td>
+                  <td className="os" style={{padding:'10px 8px',textAlign:'center',fontWeight:700,fontSize:16}}>{a.total}</td>
+                  <td className="os" style={{padding:'10px 8px',textAlign:'center',fontWeight:700,fontSize:16,color:'var(--gold)'}}>{a.gl}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {/* Bombed out */}
+      {athletes.filter(a=>a.bombed).length > 0 && (
+        <Card style={{marginTop:12}}>
+          <h3 className="os" style={{fontSize:14,color:'var(--red)',marginBottom:8,letterSpacing:1}}>BOMB OUT</h3>
+          {athletes.filter(a=>a.bombed).map(a => (
+            <div key={a.id} style={{padding:'6px 0',borderBottom:'1px solid rgba(30,58,95,.2)',fontSize:13,color:'var(--muted)'}}>
+              {a.nombre} — {a.club}
+            </div>
+          ))}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ── Render ──
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
