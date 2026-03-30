@@ -124,6 +124,7 @@ function App() {
   const [currentLift, setCurrentLift] = useState('sq');
   const [currentRound, setCurrentRound] = useState(0);
   const [viewMode, setViewMode] = useState('control');
+  const [currentFlight, setCurrentFlight] = useState('A');
   const [timer, setTimer] = useState(60);
   const [timerRunning, setTimerRunning] = useState(false);
   const [recordAlerts, setRecordAlerts] = useState([]);
@@ -137,6 +138,7 @@ function App() {
       setAthletes(saved.athletes);
       setCurrentLift(saved.currentLift || 'sq');
       setCurrentRound(saved.currentRound || 0);
+      setCurrentFlight(saved.currentFlight || 'A');
     }
     fetch('nominas.json').then(r=>r.json()).then(n=>setEvents(n.events||[])).catch(()=>{});
     fetch('records.json').then(r=>r.json()).then(r=>setRecords(r)).catch(()=>{});
@@ -144,8 +146,8 @@ function App() {
 
   // Auto-save
   useEffect(() => {
-    if (phase !== 'setup') saveState({phase, event, athletes, currentLift, currentRound});
-  }, [phase, event, athletes, currentLift, currentRound]);
+    if (phase !== 'setup') saveState({phase, event, athletes, currentLift, currentRound, currentFlight});
+  }, [phase, event, athletes, currentLift, currentRound, currentFlight]);
 
   // Timer
   useEffect(() => {
@@ -163,6 +165,8 @@ function App() {
     setEvent(ev);
     const imported = ev.athletes.map((a, i) => ({
       ...a, id: i, lot: i + 1, bodyweight: 0, bombed: false,
+      flight: 'A',
+      rackSQ: '', rackBP: '',
       attempts: makeAttempts(),
     }));
     setAthletes(imported);
@@ -289,12 +293,12 @@ function App() {
       <Header />
       <div style={{maxWidth:phase==='competition'&&viewMode==='scoreboard'?'100%':1100,margin:'0 auto',padding:phase==='competition'&&viewMode==='scoreboard'?'0':'16px 20px'}}>
         {phase === 'setup' && <SetupView events={events} onSelect={selectEvent} />}
-        {phase === 'weighin' && <WeighInView athletes={athletes} event={event} updateAthlete={updateAthlete} onStart={() => {setPhase('competition'); setCurrentLift('sq'); setCurrentRound(0);}} />}
+        {phase === 'weighin' && <WeighInView athletes={athletes} event={event} updateAthlete={updateAthlete} setAttemptWeight={setAttemptWeight} onStart={() => {setPhase('competition'); setCurrentLift('sq'); setCurrentRound(0);}} />}
         {phase === 'competition' && viewMode === 'control' && (
-          <ControlView athletes={athletes} currentLift={currentLift} currentRound={currentRound} setCurrentLift={setCurrentLift} setCurrentRound={setCurrentRound} setAttemptWeight={setAttemptWeight} recordResult={recordResult} rankings={rankings} timer={timer} timerRunning={timerRunning} startTimer={startTimer} pauseTimer={pauseTimer} resetTimer={resetTimer} onFinish={()=>setPhase('results')} records={records} event={event} />
+          <ControlView athletes={athletes} currentLift={currentLift} currentRound={currentRound} setCurrentLift={setCurrentLift} setCurrentRound={setCurrentRound} setAttemptWeight={setAttemptWeight} recordResult={recordResult} rankings={rankings} timer={timer} timerRunning={timerRunning} startTimer={startTimer} pauseTimer={pauseTimer} resetTimer={resetTimer} onFinish={()=>setPhase('results')} records={records} event={event} currentFlight={currentFlight} setCurrentFlight={setCurrentFlight} />
         )}
         {phase === 'competition' && viewMode === 'scoreboard' && (
-          <ScoreboardView athletes={athletes} currentLift={currentLift} currentRound={currentRound} rankings={rankings} event={event} timer={timer} timerRunning={timerRunning} />
+          <ScoreboardView athletes={athletes} currentLift={currentLift} currentRound={currentRound} rankings={rankings} event={event} timer={timer} timerRunning={timerRunning} currentFlight={currentFlight} />
         )}
         {phase === 'results' && <ResultsView rankings={rankings} athletes={athletes} event={event} exportResults={exportResults} records={records} />}
       </div>
@@ -347,37 +351,124 @@ function SetupView({events, onSelect}) {
 // ══════════════════════════════════════════════
 // WEIGH-IN VIEW
 // ══════════════════════════════════════════════
-function WeighInView({athletes, event, updateAthlete, onStart}) {
-  const allWeighed = athletes.every(a => a.bodyweight > 0);
+function WeighInView({athletes, event, updateAthlete, setAttemptWeight, onStart}) {
+  const [expandedId, setExpandedId] = useState(null);
+  const [filterFlight, setFilterFlight] = useState('');
+  const allReady = athletes.every(a => a.bodyweight > 0 && a.attempts.sq[0].w > 0 && a.attempts.bp[0].w > 0 && a.attempts.dl[0].w > 0);
   const weighed = athletes.filter(a => a.bodyweight > 0).length;
+  const flights = [...new Set(athletes.map(a => a.flight))].sort();
+  const filtered = filterFlight ? athletes.filter(a => a.flight === filterFlight) : athletes;
+
+  const FlightBadge = ({f}) => {
+    const colors = {A:'#3b82f6',B:'#f59e0b',C:'#22c55e',D:'#a855f7',E:'#ec4899'};
+    return <span style={{background:colors[f]||'var(--muted)',color:'#fff',padding:'2px 8px',borderRadius:4,fontSize:10,fontWeight:700,fontFamily:'Oswald'}}>{f}</span>;
+  };
   
   return (
     <div className="fade-in">
-      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',margin:'20px 0'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',margin:'20px 0',flexWrap:'wrap',gap:10}}>
         <div>
-          <h2 className="os" style={{fontSize:22,letterSpacing:1}}>PESAJE</h2>
-          <p style={{color:'var(--muted)',fontSize:12}}>{weighed}/{athletes.length} atletas pesados</p>
+          <h2 className="os" style={{fontSize:22,letterSpacing:1}}>PESAJE & CONFIGURACIÓN</h2>
+          <p style={{color:'var(--muted)',fontSize:12}}>{weighed}/{athletes.length} pesados · Vuelos: {flights.join(', ')}</p>
         </div>
-        <Btn onClick={onStart} disabled={!allWeighed} color={allWeighed?'var(--green)':'var(--border)'}>
-          Iniciar Competencia →
-        </Btn>
+        <div style={{display:'flex',gap:8}}>
+          <select value={filterFlight} onChange={e=>setFilterFlight(e.target.value)} style={{padding:'8px 12px',borderRadius:6,border:'1px solid var(--border)',background:'var(--card)',color:'var(--text)',fontSize:12}}>
+            <option value="">Todos los vuelos</option>
+            {flights.map(f=><option key={f} value={f}>Vuelo {f}</option>)}
+          </select>
+          <Btn onClick={onStart} disabled={!allReady} color={allReady?'var(--green)':'var(--border)'}>
+            Iniciar Competencia →
+          </Btn>
+        </div>
       </div>
       
-      <div style={{display:'grid',gap:6}}>
-        {athletes.map(a => (
-          <div key={a.id} style={{display:'grid',gridTemplateColumns:'40px 1fr 100px 100px 120px',gap:10,alignItems:'center',padding:'10px 14px',background:'var(--card)',borderRadius:8,border:'1px solid var(--border)',fontSize:13}}>
-            <span style={{color:'var(--gold)',fontWeight:700,fontFamily:'Oswald',textAlign:'center'}}>{a.lot}</span>
-            <div>
-              <div style={{fontWeight:600}}>{a.nombre}</div>
-              <div style={{fontSize:11,color:'var(--muted)'}}>{a.club}</div>
-            </div>
-            <span style={{textAlign:'center',color:'var(--muted)',fontSize:11}}>{a.categoria}</span>
-            <span style={{textAlign:'center',fontSize:11,color:a.sexo==='Hombre'||a.sex==='Hombre'?'var(--blue)':'var(--accent)'}}>{a.sexo||a.sex}</span>
-            <input type="number" step="0.1" placeholder="Peso (kg)" value={a.bodyweight||''} onChange={e => updateAthlete(a.id, {bodyweight: parseFloat(e.target.value)||0})}
-              style={{padding:'8px 10px',borderRadius:6,border:'1px solid '+(a.bodyweight>0?'var(--green)':'var(--border)'),background:'var(--bg)',color:'var(--text)',fontSize:13,textAlign:'center',width:'100%'}} />
-          </div>
-        ))}
+      {/* Quick stats */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:16}}>
+        {flights.map(f => {
+          const count = athletes.filter(a=>a.flight===f).length;
+          const ready = athletes.filter(a=>a.flight===f && a.bodyweight>0).length;
+          return <Card key={f} style={{padding:12,textAlign:'center',cursor:'pointer',border:filterFlight===f?'1px solid var(--accent)':'1px solid var(--border)'}} onClick={()=>setFilterFlight(filterFlight===f?'':f)}>
+            <div className="os" style={{fontSize:20,fontWeight:700}}>Vuelo {f}</div>
+            <div style={{fontSize:11,color:'var(--muted)'}}>{ready}/{count} listos</div>
+          </Card>;
+        })}
       </div>
+
+      {/* Athlete cards */}
+      <div style={{display:'grid',gap:6}}>
+        {filtered.map(a => {
+          const expanded = expandedId === a.id;
+          const ready = a.bodyweight > 0 && a.attempts.sq[0].w > 0 && a.attempts.bp[0].w > 0 && a.attempts.dl[0].w > 0;
+          return (
+            <Card key={a.id} style={{padding:0,overflow:'hidden',borderLeft:'3px solid '+(ready?'var(--green)':'var(--border)')}}>
+              {/* Header row - always visible */}
+              <div onClick={()=>setExpandedId(expanded?null:a.id)} style={{display:'grid',gridTemplateColumns:'35px 1fr auto auto auto auto 30px',gap:8,alignItems:'center',padding:'10px 14px',cursor:'pointer',fontSize:13}}>
+                <span style={{color:'var(--gold)',fontWeight:700,fontFamily:'Oswald',textAlign:'center'}}>{a.lot}</span>
+                <div style={{overflow:'hidden'}}>
+                  <div style={{fontWeight:600,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{a.nombre}</div>
+                  <div style={{fontSize:11,color:'var(--muted)'}}>{a.club}</div>
+                </div>
+                <span style={{fontSize:11,color:'var(--muted)',padding:'0 6px'}}>{a.categoria}</span>
+                <FlightBadge f={a.flight} />
+                <span style={{fontWeight:700,fontFamily:'Oswald',fontSize:14,color:a.bodyweight>0?'var(--green)':'var(--muted)',minWidth:55,textAlign:'center'}}>{a.bodyweight>0?a.bodyweight+'kg':'—'}</span>
+                <span style={{fontSize:10,color:'var(--muted)'}}>
+                  {a.attempts.sq[0].w>0?'SQ':''}
+                  {a.attempts.bp[0].w>0?' BP':''}
+                  {a.attempts.dl[0].w>0?' DL':''}
+                </span>
+                <span style={{color:'var(--muted)',fontSize:16,transition:'transform .2s',transform:expanded?'rotate(90deg)':'none'}}>›</span>
+              </div>
+              
+              {/* Expanded details */}
+              {expanded && (
+                <div style={{padding:'0 14px 14px',borderTop:'1px solid var(--border)',paddingTop:14}}>
+                  <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))',gap:10}}>
+                    {/* Flight */}
+                    <div>
+                      <label style={{fontSize:10,color:'var(--muted)',textTransform:'uppercase',letterSpacing:1,display:'block',marginBottom:4}}>Vuelo</label>
+                      <select value={a.flight} onChange={e=>updateAthlete(a.id,{flight:e.target.value})} style={{width:'100%',padding:'8px 10px',borderRadius:6,border:'1px solid var(--border)',background:'var(--bg)',color:'var(--text)',fontSize:13}}>
+                        {['A','B','C','D','E','F'].map(f=><option key={f} value={f}>{f}</option>)}
+                      </select>
+                    </div>
+                    {/* Bodyweight */}
+                    <div>
+                      <label style={{fontSize:10,color:'var(--muted)',textTransform:'uppercase',letterSpacing:1,display:'block',marginBottom:4}}>Peso Corporal (kg)</label>
+                      <input type="number" step="0.1" value={a.bodyweight||''} onChange={e=>updateAthlete(a.id,{bodyweight:parseFloat(e.target.value)||0})} style={{width:'100%',padding:'8px 10px',borderRadius:6,border:'1px solid '+(a.bodyweight>0?'var(--green)':'var(--border)'),background:'var(--bg)',color:'var(--text)',fontSize:13,textAlign:'center'}} />
+                    </div>
+                    {/* Rack SQ */}
+                    <div>
+                      <label style={{fontSize:10,color:'#3b82f6',textTransform:'uppercase',letterSpacing:1,display:'block',marginBottom:4}}>Rack Squat</label>
+                      <input type="text" placeholder="ej: 12-out" value={a.rackSQ||''} onChange={e=>updateAthlete(a.id,{rackSQ:e.target.value})} style={{width:'100%',padding:'8px 10px',borderRadius:6,border:'1px solid var(--border)',background:'var(--bg)',color:'var(--text)',fontSize:13,textAlign:'center'}} />
+                    </div>
+                    {/* Rack BP */}
+                    <div>
+                      <label style={{fontSize:10,color:'#f59e0b',textTransform:'uppercase',letterSpacing:1,display:'block',marginBottom:4}}>Rack Bench</label>
+                      <input type="text" placeholder="ej: 5" value={a.rackBP||''} onChange={e=>updateAthlete(a.id,{rackBP:e.target.value})} style={{width:'100%',padding:'8px 10px',borderRadius:6,border:'1px solid var(--border)',background:'var(--bg)',color:'var(--text)',fontSize:13,textAlign:'center'}} />
+                    </div>
+                    {/* Opener SQ */}
+                    <div>
+                      <label style={{fontSize:10,color:'#3b82f6',textTransform:'uppercase',letterSpacing:1,display:'block',marginBottom:4}}>Opener SQ (kg)</label>
+                      <input type="number" step="2.5" value={a.attempts.sq[0].w||''} onChange={e=>setAttemptWeight(a.id,'sq',0,e.target.value)} style={{width:'100%',padding:'8px 10px',borderRadius:6,border:'1px solid '+(a.attempts.sq[0].w>0?'#3b82f6':'var(--border)'),background:'var(--bg)',color:'var(--text)',fontSize:13,fontWeight:700,textAlign:'center'}} />
+                    </div>
+                    {/* Opener BP */}
+                    <div>
+                      <label style={{fontSize:10,color:'#f59e0b',textTransform:'uppercase',letterSpacing:1,display:'block',marginBottom:4}}>Opener BP (kg)</label>
+                      <input type="number" step="2.5" value={a.attempts.bp[0].w||''} onChange={e=>setAttemptWeight(a.id,'bp',0,e.target.value)} style={{width:'100%',padding:'8px 10px',borderRadius:6,border:'1px solid '+(a.attempts.bp[0].w>0?'#f59e0b':'var(--border)'),background:'var(--bg)',color:'var(--text)',fontSize:13,fontWeight:700,textAlign:'center'}} />
+                    </div>
+                    {/* Opener DL */}
+                    <div>
+                      <label style={{fontSize:10,color:'#ef4444',textTransform:'uppercase',letterSpacing:1,display:'block',marginBottom:4}}>Opener DL (kg)</label>
+                      <input type="number" step="2.5" value={a.attempts.dl[0].w||''} onChange={e=>setAttemptWeight(a.id,'dl',0,e.target.value)} style={{width:'100%',padding:'8px 10px',borderRadius:6,border:'1px solid '+(a.attempts.dl[0].w>0?'#ef4444':'var(--border)'),background:'var(--bg)',color:'var(--text)',fontSize:13,fontWeight:700,textAlign:'center'}} />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+      
+      {!allReady && <p style={{textAlign:'center',color:'var(--muted)',fontSize:12,marginTop:16}}>Completa peso corporal y openers (SQ, BP, DL) de todos los atletas para iniciar</p>}
     </div>
   );
 }
@@ -385,10 +476,12 @@ function WeighInView({athletes, event, updateAthlete, onStart}) {
 // ══════════════════════════════════════════════
 // CONTROL VIEW (Mesa de Control)
 // ══════════════════════════════════════════════
-function ControlView({athletes, currentLift, currentRound, setCurrentLift, setCurrentRound, setAttemptWeight, recordResult, rankings, timer, timerRunning, startTimer, pauseTimer, resetTimer, onFinish, records, event}) {
+function ControlView({athletes, currentLift, currentRound, setCurrentLift, setCurrentRound, setAttemptWeight, recordResult, rankings, timer, timerRunning, startTimer, pauseTimer, resetTimer, onFinish, records, event, currentFlight, setCurrentFlight}) {
   const [selectedAthlete, setSelectedAthlete] = useState(null);
   
-  const order = useMemo(() => liftOrder(athletes, currentLift, currentRound), [athletes, currentLift, currentRound]);
+  const flightAthletes = athletes.filter(a => a.flight === currentFlight);
+  const flights = [...new Set(athletes.map(a => a.flight))].sort();
+  const order = useMemo(() => liftOrder(flightAthletes, currentLift, currentRound), [flightAthletes, currentLift, currentRound]);
   const nextUp = order[0] || null;
   
   // Auto-select first in order
@@ -410,13 +503,26 @@ function ControlView({athletes, currentLift, currentRound, setCurrentLift, setCu
     }
   };
 
-  const activeAthletes = athletes.filter(a => !a.bombed);
+  const activeAthletes = flightAthletes.filter(a => !a.bombed);
   const roundDone = order.length === 0;
+  const rackInfo = selectedAthlete ? (currentLift==='sq'?selectedAthlete.rackSQ:currentLift==='bp'?selectedAthlete.rackBP:'') : '';
 
   return (
     <div className="fade-in" style={{display:'grid',gridTemplateColumns:'1fr 340px',gap:16,marginTop:16}}>
       {/* Left: Main control */}
       <div>
+        {/* Flight selector */}
+        <div style={{display:'flex',gap:6,marginBottom:10}}>
+          {flights.map(f => {
+            const fc = {A:'#3b82f6',B:'#f59e0b',C:'#22c55e',D:'#a855f7',E:'#ec4899'};
+            const count = athletes.filter(a=>a.flight===f&&!a.bombed).length;
+            return <button key={f} onClick={()=>setCurrentFlight(f)} className="os" style={{flex:1,padding:'8px 0',borderRadius:8,border:'2px solid '+(currentFlight===f?fc[f]||'var(--muted)':'var(--border)'),background:currentFlight===f?(fc[f]||'var(--muted)')+'20':'transparent',color:currentFlight===f?fc[f]||'var(--muted)':'var(--muted)',fontSize:13,fontWeight:700,letterSpacing:2,cursor:'pointer',transition:'all .2s'}}>
+              VUELO {f} <span style={{fontSize:10,opacity:.7}}>({count})</span>
+            </button>;
+          })}
+        </div>
+        
+        {/* Lift nav */}
         {/* Lift & Round nav */}
         <div style={{display:'flex',gap:6,marginBottom:12}}>
           {LIFTS.map(l => (
@@ -455,8 +561,11 @@ function ControlView({athletes, currentLift, currentRound, setCurrentLift, setCu
                 <div className="os" style={{fontSize:20,fontWeight:700}}>{selectedAthlete.nombre}</div>
                 <div style={{fontSize:12,color:'var(--muted)'}}>{selectedAthlete.club} · Lot #{selectedAthlete.lot} · {selectedAthlete.bodyweight}kg</div>
               </div>
-              <div style={{background:LIFT_COLORS[currentLift],color:'#fff',padding:'4px 12px',borderRadius:6,fontFamily:'Oswald',fontWeight:700,fontSize:13}}>
-                {LIFT_SHORT[currentLift]}{currentRound+1}
+              <div style={{display:'flex',alignItems:'center',gap:8}}>
+                {rackInfo && <span style={{background:'var(--bg)',border:'1px solid var(--border)',padding:'4px 10px',borderRadius:6,fontSize:11,color:'var(--text)'}}>🔧 Rack: <strong>{rackInfo}</strong></span>}
+                <div style={{background:LIFT_COLORS[currentLift],color:'#fff',padding:'4px 12px',borderRadius:6,fontFamily:'Oswald',fontWeight:700,fontSize:13}}>
+                  {LIFT_SHORT[currentLift]}{currentRound+1}
+                </div>
               </div>
             </div>
 
@@ -503,7 +612,10 @@ function ControlView({athletes, currentLift, currentRound, setCurrentLift, setCu
                 <span style={{color:'var(--gold)',fontWeight:700,fontFamily:'Oswald',width:24,textAlign:'center'}}>{i+1}</span>
                 <span style={{fontWeight:600,fontSize:13}}>{a.nombre}</span>
               </div>
-              <span className="os" style={{color:LIFT_COLORS[currentLift],fontWeight:700,fontSize:16}}>{a.attempts[currentLift][currentRound].w} kg</span>
+              <div style={{display:'flex',alignItems:'center',gap:6}}>
+                <span className="os" style={{color:LIFT_COLORS[currentLift],fontWeight:700,fontSize:16}}>{a.attempts[currentLift][currentRound].w} kg</span>
+                {(currentLift==='sq'&&a.rackSQ)||(currentLift==='bp'&&a.rackBP)?<span style={{fontSize:9,color:'var(--muted)',background:'var(--bg)',padding:'2px 6px',borderRadius:4}}>R:{currentLift==='sq'?a.rackSQ:a.rackBP}</span>:''}
+              </div>
             </div>
           ))}
         </Card>
@@ -563,11 +675,13 @@ function ControlView({athletes, currentLift, currentRound, setCurrentLift, setCu
 // ══════════════════════════════════════════════
 // SCOREBOARD VIEW (Proyección)
 // ══════════════════════════════════════════════
-function ScoreboardView({athletes, currentLift, currentRound, rankings, event, timer, timerRunning}) {
-  const order = liftOrder(athletes, currentLift, currentRound);
+function ScoreboardView({athletes, currentLift, currentRound, rankings, event, timer, timerRunning, currentFlight}) {
+  const flightAthletes = athletes.filter(a => a.flight === currentFlight);
+  const order = liftOrder(flightAthletes, currentLift, currentRound);
   const current = order[0];
   const onDeck = order[1];
-  const activeAthletes = athletes.filter(a => !a.bombed);
+  const rackInfo = current ? (currentLift==='sq'?current.rackSQ:currentLift==='bp'?current.rackBP:'') : '';
+  const activeAthletes = flightAthletes.filter(a => !a.bombed);
 
   return (
     <div style={{minHeight:'100vh',background:'var(--bg)',padding:0}}>
@@ -577,7 +691,7 @@ function ScoreboardView({athletes, currentLift, currentRound, rankings, event, t
         <div className="os" style={{fontSize:16,letterSpacing:1}}>{event?.short}</div>
         <div style={{display:'flex',alignItems:'center',gap:16}}>
           <div className="os" style={{fontSize:14,letterSpacing:2,background:LIFT_COLORS[currentLift],padding:'4px 16px',borderRadius:6,fontWeight:700}}>
-            {LIFT_NAMES[currentLift]} — INTENTO {currentRound+1}
+            VUELO {currentFlight} — {LIFT_NAMES[currentLift]} — INTENTO {currentRound+1}
           </div>
         </div>
       </div>
@@ -591,7 +705,10 @@ function ScoreboardView({athletes, currentLift, currentRound, rankings, event, t
               {timerRunning && <span className={timer<=10?'pulse':''}>{Math.floor(timer/60)}:{String(timer%60).padStart(2,'0')}</span>}
             </div>
             <div className="os" style={{fontSize:'clamp(32px,5vw,52px)',fontWeight:700,letterSpacing:2,textAlign:'center',marginBottom:8}}>{current.nombre}</div>
-            <div style={{color:'var(--muted)',fontSize:16,marginBottom:24}}>{current.club} · {current.bodyweight}kg · Lot #{current.lot}</div>
+            <div style={{color:'var(--muted)',fontSize:16,marginBottom:24}}>
+              {current.club} · {current.bodyweight}kg · Lot #{current.lot}
+              {rackInfo && <span style={{marginLeft:12,background:'rgba(255,255,255,.1)',padding:'3px 12px',borderRadius:6,fontSize:14}}>🔧 Rack: <strong style={{color:'var(--text)'}}>{rackInfo}</strong></span>}
+            </div>
             <div className="os" style={{fontSize:80,fontWeight:700,color:LIFT_COLORS[currentLift],letterSpacing:4}}>
               {current.attempts[currentLift][currentRound].w || '—'} <span style={{fontSize:36,color:'var(--muted)'}}>KG</span>
             </div>
@@ -607,7 +724,10 @@ function ScoreboardView({athletes, currentLift, currentRound, rankings, event, t
                 </div>
               ))}
             </div>
-            {onDeck && <div style={{marginTop:40,color:'var(--muted)',fontSize:13}}>Siguiente: <span style={{color:'var(--text)',fontWeight:600}}>{onDeck.nombre}</span> — {onDeck.attempts[currentLift][currentRound].w}kg</div>}
+            {onDeck && <div style={{marginTop:40,color:'var(--muted)',fontSize:13}}>
+              Siguiente: <span style={{color:'var(--text)',fontWeight:600}}>{onDeck.nombre}</span> — {onDeck.attempts[currentLift][currentRound].w}kg
+              {((currentLift==='sq'&&onDeck.rackSQ)||(currentLift==='bp'&&onDeck.rackBP)) && <span style={{marginLeft:8,fontSize:12}}>· Rack: {currentLift==='sq'?onDeck.rackSQ:onDeck.rackBP}</span>}
+            </div>}
           </>) : (
             <div className="os" style={{fontSize:28,color:'var(--gold)',letterSpacing:2}}>RONDA COMPLETADA</div>
           )}
